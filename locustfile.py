@@ -1,10 +1,9 @@
-import json
 import uuid
 import random
 import gevent
-from locust import HttpUser, task, between, tag
+from locust import HttpUser, task, between
 from faker import Faker
-
+from requests import Response
 from models import Box
 
 fake = Faker()
@@ -19,7 +18,9 @@ def load_users():
         users = list(usernames.read().splitlines())
     return users
 
+
 users = load_users()
+
 
 class EnquiryboxUser(HttpUser):
     def on_start(self):
@@ -31,12 +32,28 @@ class EnquiryboxUser(HttpUser):
     def get_auth_header(self):
         return {"Authorization": f"Bearer {self.token}"}
 
+    def get(self, url: str, fields: dict = None, params: dict = None):
+        format_dict = self.__dict__.copy()
+        if fields:
+            format_dict.update(**fields)
+
+        final_url = f"{self.host}/api/{url.format(**format_dict)}"
+        response: Response = self.client.get(
+            final_url,
+            headers=self.get_auth_header(),
+            name=url,
+        )
+        response.raise_for_status()
+        return response
+
     def login(self):
         self.username = random.choice(users)
         users.remove(self.username)
+        # self.username = "tejesh.kaliki+test@gmail.com"
         response = self.client.post(
             f"{self.host}/api/login/",
             json={"username": self.username, "password": "password"},
+            # json={"username": self.username, "password": "Tejesh@2003"},
         )
         if response.status_code == 200:
             self.token = response.json().get("access")
@@ -103,74 +120,93 @@ class LeadGenerationUser(EnquiryboxUser):
 
 
 class LeadListViewUser(EnquiryboxUser):
-    wait_time = between(1, 3)
+    wait_time = between(4, 6)
 
     def initial_tasks(self):
         self.get_user_info()
+        gevent.joinall(
+            [
+                gevent.spawn(self.get_all_boxes),
+                gevent.spawn(self.get_organization_users),
+                gevent.spawn(self.get_channels),
+                gevent.spawn(self.get_or_create_nudges),
+                gevent.spawn(self.get_reply_templates),
+                gevent.spawn(self.get_plans),
+                gevent.spawn(self.get_countries),
+                gevent.spawn(self.get_lead_counts),
+                gevent.spawn(self.things_to_do_list),
+            ]
+        )
 
     def get_user_info(self):
-        response = self.client.get(
-            f"{self.host}/api/users/my_info",
-            headers=self.get_auth_header(),
-        )
+        response = self.get("users/my_info")
         if response.status_code == 200:
             response_json = response.json()
             self.user_id = response_json.get("id")
 
-    @task(1)
-    def things_to_do_list(self):
-        with self.client.rename_request("/api/leads/sub_organizations/:sub_org_id/leads"):
-            self.client.get(
-                f"{self.host}/api/leads/sub_organizations/{self.sub_org_id}/leads",
-                headers=self.get_auth_header(),
-                params={
-                    "page": 1,
-                    "filter_by": 1,
-                    "assigned_to": self.user_id,
-                },
-            )
+    def get_organization_users(self):
+        self.get("organization/sub_organizations/{sub_org_id}/organization_users")
+
+    def get_channels(self):
+        self.get("channels/get_all_global_channels")
+        self.get("channels/{sub_org_id}/get_all_pending_channels")
+        self.get("channels/{sub_org_id}/get_all_connected_channels")
+
+    def get_or_create_nudges(self):
+        self.get("organization/get_or_create_nudges", params={"user_id": self.user_id})
+
+    def get_reply_templates(self):
+        self.get("reply_templates/sub_organizations/{sub_org_id}/templates/")
+
+    def get_plans(self):
+        self.get("plans/get_plans/{sub_org_id}")
+
+    def get_countries(self):
+        self.get("countries/get_countries_list")
+
+    def get_lead_counts(self):
+        self.get(
+            "leads/get_all_lead_count",
+            params={"sub_organization_id": self.sub_org_id},
+        )
+        self.get(
+            "leads/sub_organizations/{sub_org_id}/things_to_do/get_the_count_enquiry_and_task",
+            params={"assigned_to": self.user_id},
+        )
 
     def get_all_boxes(self):
-        with self.client.rename_request("/api/box/get_all_box/:sub_org_id"):
-            response = self.client.get(
-                f"{self.host}/api/box/get_all_box/{self.sub_org_id}",
-                headers=self.get_auth_header(),
-            )
+        response = self.get("box/get_all_box/{sub_org_id}")
         if response.status_code == 200:
             response_json = response.json()
             results = response_json.get("results", [])
             self.boxes = [Box(**result) for result in results]
 
     def fetch_stage_leads(self, stage_id):
-        with self.client.rename_request("/api/leads/list_lead_in_stage/:stage_id"):
-            self.client.get(
-                f"{self.host}/api/leads/list_lead_in_stage/{stage_id}",
-                headers=self.get_auth_header(),
-                params={
-                    "page": 1,
-                    "filter_by": 1,
-                }
-            )
+        self.get(
+            "leads/list_lead_in_stage/{stage_id}",
+            fields={"stage_id": stage_id},
+            params={"page": 1, "filter_by": 1},
+        )
+
+    @task(1)
+    def things_to_do_list(self):
+        self.get(
+            "leads/sub_organizations/{sub_org_id}/leads",
+            params={"page": 1, "filter_by": 1, "assigned_to": self.user_id},
+        )
 
     @task(2)
     def list_leads_in_stage(self):
-        if not hasattr(self, "boxes"):
-            self.get_all_boxes()
-
         box = random.choice(self.boxes)
 
         # Spawn greenlets to make requests in parallel
         greenlets = [
-            gevent.spawn(self.fetch_stage_leads, stage.id)
-            for stage in box.boxstage_set
+            gevent.spawn(self.fetch_stage_leads, stage.id) for stage in box.boxstage_set
         ]
         gevent.joinall(greenlets)
-    
+
     @task(3)
     def list_lead_in_single_stage(self):
-        if not hasattr(self, "boxes"):
-            self.get_all_boxes()
-        
         box = random.choice(self.boxes)
         stage = random.choice(box.boxstage_set)
 
